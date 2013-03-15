@@ -33,6 +33,8 @@ Provides:
     - When password was last set
 
 TODO:
+  - "More python-y, object-oriented v2.0" that supports more user/group
+	modification actions.
   - Better sanitization of user input
   x Better exception handling/throwing
   x Force SSL (can only change passwords over SSL)
