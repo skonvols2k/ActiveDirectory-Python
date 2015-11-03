@@ -6,57 +6,157 @@ from datetime import timedelta, datetime
 import pytz
 import re
 
-class ActiveDirectoryPasswordManager(object):
-    '''
-    Interval attributes can be used in 2 ways:
-      - Relative Intervals (min/max pwd age): negative time, combined with current time's Absolute Interval
-      - Absolute Intervals: (pwdLastSet) time since Jan 1, 1601 00:00 UTC
-    '''
-    def __init__(self, ldap_object, ldap_base=''):
-        self.ldap_conn = ldap_object
-        self.rootdse = self._query_rootdse()
-        if not ldap_base:
-            ldap_base = self.rootdse['defaultNamingContext']  # this should be configurable
-        self.ldap_base = ldap_base
-        self.domain_pwpolicy = self.get_domain_pwpolicy()
-        self.fgpp_supported = self._is_fgpp_supported()
+class ActiveDirectoryPasswordController(object):
+    # https://msdn.microsoft.com/en-us/library/ms684291(v=vs.85).aspx
+    _domainFunctionality_map = dict(
+            WIN2000=0,
+            WIN2003_INTERIM=1,
+            WIN2003=2,
+            WIN2008=3,
+            WIN2008R2=4)
 
-    #def __init__(self, uri, ldap_base=''):
+    # Code 49 (Invalid Credentials) Data Codes: http://www-01.ibm.com/support/docview.wss?uid=swg21290631
+    _invalid_credentials_codes = dict(
+            user_not_found='525',
+            login_time_restricted='530',
+            login_workstation_restricted='531',
+            password_incorrect='52e',
+            password_expired_natural='532',
+            password_expired_forced='733',
+            account_disabled='533',
+            account_expired='701',
+            account_locked='775')
+
+    # What user attributes do we want and in what domain levels of AD are they available
+    # I broke the dict() convention since some keys have '-' characters.
+    _user_attribute_level_map = {
+            'sAMAccountName': 0,
+            'sAMAccountType': 0,
+            'pwdLastSet': 0,
+            'lastLogonTimestamp': 2,
+            'lockoutTime': 0,
+            'accountExpires': 0,
+            'msDS-User-Account-Control-Computed': 2,
+            'logonHours': 0,
+            'userWorkstations': 0,
+            'msDS-ResultantPSO': 3,
+            'msDS-FailedInteractiveLogonCount': 3,
+            'msDS-FailedInteractiveLogonCountAtLastSuccessfulLogon': 3}
+
+    def __init__(self, ldap_obj, ldap_base=''):
+        self.ldap_obj = ldap_obj
+        self.rootdse = self._get_rootdse(ldap_obj)
+        self.domainlevel_int = self._get_domainfunctionality_int(self.rootdse)
+        self.domainlevel_str = self._get_domainfunctionality_str(self.domainlevel_int)
+        if not self._is_uaccomputed_supported(ldap_obj):
+            print 'I really rely on msDS-User-Account-Control-Computed which is only available in domain level 2003+'
+            return None
+        if not ldap_base:
+            ldap_base = self._get_defaultnamingcontext(ldap_obj)
+        self.ldap_base = ldap_base
+        self.domain_policy = self.DomainPasswordPolicy.get_policy(ldap_obj, ldap_base)
+        self.fgpp_supported = self._is_fgpp_supported(ldap_obj)
+        if self.fgpp_supported:
+            self.granular_policies = self.GranularPasswordPolicy.get_all_policies(ldap_obj, ldap_base)
+
+    '''
+    Things I still need to do:
+        - Look up user information by username
+            - msDS-User-Account-Control-Computed (domain level 2003+)
+        - Let users change their password using their current password
+            - unless something prevents them from doing it themselves
+        - Let admins reset user passwords
+    '''
+    def get_user_info(self, username):
+        available_attributes = self._get_available_attributes(self._user_attribute_level_map, self.domainlevel_int)
+        ldap_filter = '(samaccountname={0})'.format(username)
+        result = self.ldap_obj.search_s(self.ldap_base, ldap.SCOPE_SUBTREE, ldap_filter, attrlist=available_attributes)
+        (dn, attributes) = next(self._flattened_result_generator(result))
+        print dn, attributes
+        return attributes
+
+    # "Helper" functions follow. They don't need instantiated class.
     @classmethod
-    def from_domainlookup(cls, domain):
+    def _parse_logonhours(cls, logonhours):
         '''
-        DNS lookup _ldap._tcp SRV record on parameter domain and
-        return new instance with URI set to random server.
+        http://blogs.msmvps.com/richardsiddaway/2008/08/18/ad-logon-hours/
+
+        logonhours is 21-byte field.
+        Each day of the week is 3 bytes.
+        Each hour is 1 bit.
+
+        itertools.izip(u, itertools.islice(u, 1, None), itertools.islice(u, 2, None))
+        struct.unpack('21B', warden['logonHours'])
         '''
+        byte_tup = strcut.unpack('21B', logonhours)
+        weekdays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+        hour_masks = [2**i for i in xrange(24)]  # every bit in 3 bytes
+        for day in weekdays:
+            for (morning, midday, evening) in itertools.izip(byte_tup, itertools.islice(byte_tup, 1, None), itertools.islice(byte_tup, 2, None)):
+                hours = morning | (midday << 8) | (evening << 16)
         pass
 
-    def _process_domain_pwpolicy_attributes(self, domain_pwpolicy):
-        '''
-        Convert relative interval attributes to timedeltas and pwdProperties to a dict.
-        '''
-        relative_interval_attributes = ['minPwdAge', 'maxPwdAge']
-        for (key, value) in domain_pwpolicy.iteritems():
-            if key in relative_interval_attributes:
-                domain_pwpolicy[key] = self._relative_adinterval_to_timedelta(value)
-            if key == 'pwdProperties':
-                domain_pwpolicy[key] = self._process_pwdproperties(value)
-        return domain_pwpolicy
+    @classmethod
+    def _get_available_attributes(cls, attribute_level_dict, domainlevel_int):
+        available_attributes = list()
+        for (attribute, level) in attribute_level_dict.iteritems():
+            if domainlevel_int >= level:
+                available_attributes.append(attribute)
+        return available_attributes
 
+    @classmethod
+    def _get_defaultnamingcontext(cls, ldap_obj):
+        rootdse = cls._get_rootdse(ldap_obj)
+        return rootdse['defaultNamingContext']
 
-    def _query_rootdse(self):
+    @classmethod
+    def _get_domainfunctionality_int(cls, rootdse):
+        return int(rootdse.get('domainFunctionality', '0'))
+
+    @classmethod
+    def _get_domainfunctionality_str(cls, level_int):
+        '''
+        Return name of domain functionality level given integer value from RootDSE domainFunctionality.
+        '''
+        domainFunctionality_map_inv = dict((level, name) for (name, level) in cls._domainFunctionality_map.iteritems())
+        return domainFunctionality_map_inv[level_int]
+
+    @classmethod
+    def _get_rootdse(cls, ldap_obj):
         '''
         Anonymous bind to our computed LDAP URI and query the Root DSE.
         '''
-        result = self.ldap_conn.search_s('', ldap.SCOPE_BASE)
-        (dn, attributes) = next(self._flattened_result_generator(result))
-        return attributes
+        result = ldap_obj.search_s('', ldap.SCOPE_BASE)
+        (dn, rootdse) = next(cls._flattened_result_generator(result))
+        return rootdse
 
-    def _is_fgpp_supported(self):
+    @classmethod
+    def _is_uaccomputed_supported(cls, ldap_obj):
+        '''
+        Return true if dynamic/computed User Account Control is available, false otherwise.
+        '''
+        rootdse = cls._get_rootdse(ldap_obj)
+        domainlevel_int = cls._get_domainfunctionality_int(rootdse)
+        return cls._check_domain_level(domainlevel_int, 'WIN2003')
+
+    @classmethod
+    def _is_fgpp_supported(cls, ldap_obj):
         '''
         Return true if Fine-Grained Password Policies are supported, false otherwise.
         '''
-        domainFunctionality = int(self.rootdse.get('domainFunctionality', '0'))
-        return True if domainFunctionality >= 3 else False
+        rootdse = cls._get_rootdse(ldap_obj)
+        domainlevel_int = cls._get_domainfunctionality_int(rootdse)
+        return cls._check_domain_level(domainlevel_int, 'WIN2008')
+
+    @classmethod
+    def _check_domain_level(cls, domainlevel_int, domainlevel_str):
+        '''
+        Return true if the integer value of domainFunctionality covers
+        domainlevel_str.
+
+        _domainFunctionality_map is used to convert domainlevel_str to integer value.
+        '''
+        return True if int(domainlevel_int) >= cls._domainFunctionality_map[domainlevel_str] else False
 
     @classmethod
     def _relative_adinterval_to_timedelta(cls, adinterval):
@@ -106,7 +206,11 @@ class ActiveDirectoryPasswordManager(object):
         '''
         Wrapper to _flatten_list, this returns a new result attributes dict
         with the dict values "flattened".
+
+        If no attributes are returned, d will be a list.
         '''
+        if isinstance(d, list):
+            return
         for (key, value) in d.iteritems():
             d[key] = cls._flatten_list(value)
         return d
@@ -127,6 +231,7 @@ class ActiveDirectoryPasswordManager(object):
             else:
                 return l[0]
         return l
+    # End "helper functions"
 
 	def user_authn_pwd_verify(self, user, user_pwd):
 		# Attempt to bind but only throw an exception if the password is incorrect or the account
@@ -354,36 +459,10 @@ class ActiveDirectoryPasswordManager(object):
 					return admin
 		return admin
 
-    # AD's date format is 100 nanosecond intervals since Jan 1 1601 in GMT.
-    # To convert to seconds, divide by 10000000.
-    # To convert to UNIX, convert to positive seconds and add 11644473600 to be seconds since Jan 1 1970 (epoch).
-	def ad_time_to_seconds(self, ad_time):
-		return -(int(ad_time) / 10000000)
-
-	def ad_seconds_to_unix(self, ad_seconds):
-		return  ((int(ad_seconds) + 11644473600) if int(ad_seconds) != 0 else 0)
-
-	def ad_time_to_unix(self, ad_time):
-		#  A value of 0 or 0x7FFFFFFFFFFFFFFF (9223372036854775807) indicates that the account never expires.
-		# FIXME: Better handling of account-expires!
-		if ad_time == "9223372036854775807":
-			ad_time = "0"
-		ad_seconds = self.ad_time_to_seconds(ad_time)
-		return -self.ad_seconds_to_unix(ad_seconds)
-
 	# Exception creators
 	def parse_invalid_credentials(self, e, user_dn):
 		if not isinstance(e, ldap.INVALID_CREDENTIALS):
 			return None
-		ldapcodes ={'525' : 'user not found',
-					'52e' : 'invalid credentials',
-					'530' : 'user not permitted to logon at this time',
-					'531' : 'user not permitted to logon at this workstation',
-					'532' : 'password expired',
-					'533' : 'account disabled',
-					'701' : 'account expired',
-					'773' : 'forced expired password',
-					'775' : 'account locked'}	
 		ldapcode_pattern = r".*AcceptSecurityContext error, data (?P<ldapcode>[^,]+),"
 		m = re.match(ldapcode_pattern, e[0]['info'])
 		if not m or not len(m.groups()) > 0 or m.group('ldapcode') not in ldapcodes:
@@ -529,7 +608,7 @@ class ActiveDirectoryPasswordManager(object):
                                          'authfail_lockout_window',
                                          'authfail_lockout_duration']
 
-        def __init__(self, policy_dict):
+        def __init__(self, policy_dict, policy_dn):
             '''
             Determine which keys in policy_dict map to the correct attribute.
             Set the resulting values as attributes of this class.
@@ -537,8 +616,21 @@ class ActiveDirectoryPasswordManager(object):
             for (policy_key, dict_key) in self._attribute_map.iteritems():
                 value = policy_dict.get(dict_key, None)
                 if value is not None and policy_key in self._relative_interval_attributes:
-                    value = ActiveDirectoryPasswordManager._relative_adinterval_to_timedelta(value)
+                    value = ActiveDirectoryPasswordController._relative_adinterval_to_timedelta(value)
                 setattr(self, policy_key, value)
+            self.policy_dn = policy_dn
+
+        @classmethod
+        def get_policy(cls, ldap_obj, policy_dn):
+            '''
+            Get password policy.
+            '''
+            policy_ldap_attributes = cls._attribute_map.values()
+            result = ldap_obj.search_s(policy_dn, ldap.SCOPE_BASE, attrlist=policy_ldap_attributes)
+            (policy_dn, policy_dict) = next(ActiveDirectoryPasswordController._flattened_result_generator(result))
+            if not policy_dict:
+                return None  # raise exception?
+            return cls(policy_dict, policy_dn)
 
 
     class DomainPasswordPolicy(PasswordPolicy):
@@ -562,20 +654,16 @@ class ActiveDirectoryPasswordManager(object):
                                       DOMAIN_PASSWORD_STORE_CLEARTEXT=16,
                                       DOMAIN_REFUSE_PASSWORD_CHANGE=32)
 
-        def __init__(self, policy_dict):
-            super(ActiveDirectoryPasswordManager.DomainPasswordPolicy, self).__init__(policy_dict)
+        def __init__(self, policy_dict, policy_dn):
+            super(ActiveDirectoryPasswordController.DomainPasswordPolicy, self).__init__(policy_dict, policy_dn)
             self.password_complexity_enforced = self._is_complexity_enabled(self.password_complexity_enforced)
             self.password_cleartext_available = self._is_cleartext_available(self.password_cleartext_available)
 
         @classmethod
-        def get_domain_policy(cls, ldap_obj, ldap_base):
-            '''
-            Get domain-wide password policy.
-            '''
-            domain_pwpolicy_attributes = ['minPwdLength', 'minPwdAge', 'maxPwdAge', 'pwdHistoryLength', 'pwdProperties']
-            result = self.ldap_conn.search_s(self.ldap_base, ldap.SCOPE_BASE, attrlist=domain_pwpolicy_attributes)
-            (dn, attributes) = next(self._flattened_result_generator(result))
-            return attributes
+        def get_policy(cls, ldap_obj, policy_dn=''):
+            if not policy_dn:
+                policy_dn = ActiveDirectoryPasswordController._get_defaultnamingcontext(ldap_obj)
+            return super(ActiveDirectoryPasswordController.DomainPasswordPolicy, cls).get_policy(ldap_obj, policy_dn)
 
         @classmethod
         def _is_complexity_enabled(cls, pwdproperties):
@@ -606,9 +694,17 @@ class ActiveDirectoryPasswordManager(object):
     class GranularPasswordPolicy(PasswordPolicy):
         '''
         Fine Grained Password Policy (fgpp):
-        - LDAP objectclass: https://msdn.microsoft.com/en-us/library/hh338661(v=vs.85).aspx
+          - LDAP objectclass: https://msdn.microsoft.com/en-us/library/hh338661(v=vs.85).aspx
+
+        Container for Fine Grained Password Policies:
+          - LDAP objectclass: https://msdn.microsoft.com/en-us/library/hh338662(v=vs.85).aspx
 
         Requires domain functional level 2008+ (requires all 2008+ DCs).
+
+        By default, only members of "Domain Admins" can run CRUD ops on fgpp.
+        This means that ldap_obj must be authn'd by a user that is either
+        a member of "Domain Admins" or has been granted read access on the
+        Password Settings Container object and children.
         '''
 
         _attribute_map = dict(password_min_length='msDS-MinimumPasswordLength',
@@ -620,3 +716,28 @@ class ActiveDirectoryPasswordManager(object):
                               authfail_lockout_threshold='msDS-LockoutThreshold',
                               authfail_lockout_window='msDS-LockoutObservationWindow',
                               authfail_lockout_duration='msDS-LockoutDuration')
+
+        def __init__(self, policy_dict, policy_dn):
+            super(ActiveDirectoryPasswordController.GranularPasswordPolicy, self).__init__(policy_dict, policy_dn)
+
+        @classmethod
+        def get_all_policies(cls, ldap_obj, ldap_base=''):
+            '''
+            Make sure we can query fgpp container, then load all its child policies.
+            '''
+            if not ActiveDirectoryPasswordController._is_fgpp_supported(ldap_obj):
+                print 'Fine Grained Password Policies not supported on your effective domain level.'
+                return None
+            if not ldap_base:
+                ldap_base = ActiveDirectoryPasswordController._get_defaultnamingcontext(ldap_obj)
+            fgpp_container_base = 'cn=Password Settings Container,cn=System,{0}'.format(ldap_base)
+            result = ldap_obj.search_s(fgpp_container_base, ldap.SCOPE_BASE, '(objectclass=msDS-PasswordSettingsContainer)')
+            if not result:
+                print 'FGPP supported but container could not be found. Likely because you are not bound as a user with permissions to read fgpp.'
+                return None
+            # FGPP supported and container located. Safe to query for policies.
+            result = ldap_obj.search_s(fgpp_container_base, ldap.SCOPE_SUBTREE, '(objectclass=msDS-PasswordSettings)')
+            policies = dict()
+            for (policy_dn, ignored) in result:
+                policies[policy_dn] = super(ActiveDirectoryPasswordController.GranularPasswordPolicy, cls).get_policy(ldap_obj, policy_dn)
+            return policies
