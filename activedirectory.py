@@ -2,38 +2,131 @@
 import ldap
 
 # Internal Dependencies
-import datetime
+from datetime import timedelta, datetime
+import pytz
 import re
 
-class activedirectory:
+class ActiveDirectoryPasswordManager(object):
+    '''
+    Interval attributes can be used in 2 ways:
+      - Relative Intervals (min/max pwd age): negative time, combined with current time's Absolute Interval
+      - Absolute Intervals: (pwdLastSet) time since Jan 1, 1601 00:00 UTC
+    '''
+    def __init__(self, ldap_object, ldap_base=''):
+        self.ldap_conn = ldap_object
+        self.rootdse = self._query_rootdse()
+        if not ldap_base:
+            ldap_base = self.rootdse['defaultNamingContext']  # this should be configurable
+        self.ldap_base = ldap_base
+        self.domain_pwpolicy = self.get_domain_pwpolicy()
+        self.fgpp_supported = self._is_fgpp_supported()
 
-	# User configurable
-	# Which account states will you allow to change their own password?
-	# Any combination of:
-	# 	['acct_pwd_expired', 'acct_expired', 'acct_disabled', 'acct_locked']
-	can_change_pwd_states = ['acct_pwd_expired']
+    #def __init__(self, uri, ldap_base=''):
+    @classmethod
+    def from_domainlookup(cls, domain):
+        '''
+        DNS lookup _ldap._tcp SRV record on parameter domain and
+        return new instance with URI set to random server.
+        '''
+        pass
 
-	# Internal
-	domain_pwd_policy = {}
-	granular_pwd_policy = {} # keys are policy DNs
+    def _process_domain_pwpolicy_attributes(self, domain_pwpolicy):
+        '''
+        Convert relative interval attributes to timedeltas and pwdProperties to a dict.
+        '''
+        relative_interval_attributes = ['minPwdAge', 'maxPwdAge']
+        for (key, value) in domain_pwpolicy.iteritems():
+            if key in relative_interval_attributes:
+                domain_pwpolicy[key] = self._relative_adinterval_to_timedelta(value)
+            if key == 'pwdProperties':
+                domain_pwpolicy[key] = self._process_pwdproperties(value)
+        return domain_pwpolicy
 
-	def __init__(self, host, base, bind_dn, bind_pwd):
-		ldap.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, 0)
-		ldap.set_option(ldap.OPT_REFERRALS, 0)
-		ldap.set_option(ldap.OPT_PROTOCOL_VERSION, 3)
-		self.conn = None
-		self.host = host
-		self.uri = "ldaps://%s" % (host)
-		self.base = base
-		self.bind_dn = bind_dn
-		try:
-			self.conn = ldap.initialize(self.uri)
-			self.conn.simple_bind_s(bind_dn, bind_pwd)
-			if not self.is_admin(bind_dn):
-				return None
-			self.get_pwd_policies()
-		except ldap.LDAPError, e:
-			raise self.ldap_error(e)
+
+    def _query_rootdse(self):
+        '''
+        Anonymous bind to our computed LDAP URI and query the Root DSE.
+        '''
+        result = self.ldap_conn.search_s('', ldap.SCOPE_BASE)
+        (dn, attributes) = next(self._flattened_result_generator(result))
+        return attributes
+
+    def _is_fgpp_supported(self):
+        '''
+        Return true if Fine-Grained Password Policies are supported, false otherwise.
+        '''
+        domainFunctionality = int(self.rootdse.get('domainFunctionality', '0'))
+        return True if domainFunctionality >= 3 else False
+
+    @classmethod
+    def _relative_adinterval_to_timedelta(cls, adinterval):
+        '''
+        Converts Relative AD Interval (https://msdn.microsoft.com/en-us/library/ms684426(v=vs.85).aspx)
+        to positive Python timedelta.
+
+        Returns None if the interval represents 'never'.
+
+        :param adinterval: string of negative long int representing 100-nanosecond intervals
+        '''
+        relative_never = [-0x8000000000000000]
+        adinterval_int = int(adinterval)
+        if adinterval_int in relative_never:
+            return None
+        seconds = abs(adinterval_int / 10000000)
+        return timedelta(seconds=seconds)
+
+    @classmethod
+    def _absolute_adinterval_to_datetime(cls, adinterval):
+        '''
+        Converts Absolute AD Interval (https://msdn.microsoft.com/en-us/library/ms684426(v=vs.85).aspx)
+        to Python datetime in UTC.
+
+        Returns None if the interval represents 'never'.
+
+        :param adinterval: string of long int representing 100-nanosecond intervals since Jan 1, 1601 UTC
+        '''
+        absolute_never = [0, 0x7FFFFFFFFFFFFFFF]
+        if int(adinterval) in absolute_never:
+            return None
+        delta = cls._relative_adinterval_to_timedelta(adinterval)
+        ad_epoch = datetime(1601, 1, 1, tzinfo=pytz.utc)
+        return ad_epoch + delta
+
+    @classmethod
+    def _flattened_result_generator(cls, result):
+        '''
+        Wrapper to _flatten_attributes that processes and returns the first result.
+        '''
+        for (dn, attributes) in result:
+            attributes = cls._flatten_attributes(attributes)
+            yield (dn, attributes)
+
+    @classmethod
+    def _flatten_attributes(cls, d):
+        '''
+        Wrapper to _flatten_list, this returns a new result attributes dict
+        with the dict values "flattened".
+        '''
+        for (key, value) in d.iteritems():
+            d[key] = cls._flatten_list(value)
+        return d
+
+    @classmethod
+    def _flatten_list(cls, l):
+        '''
+        Shamelessly stolen from https://github.com/meyersh/mldap/blob/master/functions.py
+        Given a list of no elements, return None.
+        Given a list of one element, return just the element.
+        given a list of more than one element, return the list.
+        '''
+        if not l:
+            return None
+        if isinstance(l, list):
+            if len(l) > 1:
+                return l
+            else:
+                return l[0]
+        return l
 
 	def user_authn_pwd_verify(self, user, user_pwd):
 		# Attempt to bind but only throw an exception if the password is incorrect or the account
@@ -413,3 +506,117 @@ class activedirectory:
 			self.msg = 'LDAP Error. desc: %s info: %s' % (e[0]['desc'], e[0]['info'])
 		def __str__(self):
 			return str(self.msg)
+
+    class PasswordPolicy(object):
+        '''
+        This is the base class for AD Password Policies.
+        It expects to be subclassed with _policy_attributes modified.
+        The keys   to _attribute_map should remain unchanged.
+        The values of _attribute_map should be the source LDAP attribute.
+        If the Policy key requires special processing, it should be done in the subclass.
+        '''
+        _attribute_map = dict(password_min_length=None,
+                              password_min_age=None,
+                              password_max_age=None,
+                              password_history_length=None,
+                              password_complexity_enforced=None,
+                              password_cleartext_available=None,
+                              authfail_lockout_threshold=None,
+                              authfail_lockout_window=None,
+                              authfail_lockout_duration=None)
+        _relative_interval_attributes = ['password_min_age',
+                                         'password_max_age',
+                                         'authfail_lockout_window',
+                                         'authfail_lockout_duration']
+
+        def __init__(self, policy_dict):
+            '''
+            Determine which keys in policy_dict map to the correct attribute.
+            Set the resulting values as attributes of this class.
+            '''
+            for (policy_key, dict_key) in self._attribute_map.iteritems():
+                value = policy_dict.get(dict_key, None)
+                if value is not None and policy_key in self._relative_interval_attributes:
+                    value = ActiveDirectoryPasswordManager._relative_adinterval_to_timedelta(value)
+                setattr(self, policy_key, value)
+
+
+    class DomainPasswordPolicy(PasswordPolicy):
+        '''
+        Domain-wide password policy (pre-2008):
+         - LDAP objectclass: https://msdn.microsoft.com/en-us/library/ms682209(v=vs.85).aspx
+        '''
+        _attribute_map = dict(password_min_length='minPwdLength',
+                              password_min_age='minPwdAge',
+                              password_max_age='maxPwdAge',
+                              password_history_length='pwdHistoryLength',
+                              password_complexity_enforced='pwdProperties',
+                              password_cleartext_available='pwdProperties',
+                              authfail_lockout_threshold='lockoutThreshold',
+                              authfail_lockout_window='lockoutObservationWindow',
+                              authfail_lockout_duration='lockoutDuration')
+        _pwdproperties_options = dict(DOMAIN_PASSWORD_COMPLEX=1,
+                                      DOMAIN_PASSWORD_NO_ANON_CHANGE=2,
+                                      DOMAIN_PASSWORD_NO_CLEAR_CHANGE=4,
+                                      DOMAIN_LOCKOUT_ADMINS=8,
+                                      DOMAIN_PASSWORD_STORE_CLEARTEXT=16,
+                                      DOMAIN_REFUSE_PASSWORD_CHANGE=32)
+
+        def __init__(self, policy_dict):
+            super(ActiveDirectoryPasswordManager.DomainPasswordPolicy, self).__init__(policy_dict)
+            self.password_complexity_enforced = self._is_complexity_enabled(self.password_complexity_enforced)
+            self.password_cleartext_available = self._is_cleartext_available(self.password_cleartext_available)
+
+        @classmethod
+        def get_domain_policy(cls, ldap_obj, ldap_base):
+            '''
+            Get domain-wide password policy.
+            '''
+            domain_pwpolicy_attributes = ['minPwdLength', 'minPwdAge', 'maxPwdAge', 'pwdHistoryLength', 'pwdProperties']
+            result = self.ldap_conn.search_s(self.ldap_base, ldap.SCOPE_BASE, attrlist=domain_pwpolicy_attributes)
+            (dn, attributes) = next(self._flattened_result_generator(result))
+            return attributes
+
+        @classmethod
+        def _is_complexity_enabled(cls, pwdproperties):
+            properties_dict = cls._process_pwdproperties(pwdproperties)
+            return properties_dict['DOMAIN_PASSWORD_COMPLEX']
+
+        @classmethod
+        def _is_cleartext_available(cls, pwdproperties):
+            properties_dict = cls._process_pwdproperties(pwdproperties)
+            return properties_dict['DOMAIN_PASSWORD_STORE_CLEARTEXT']
+
+        @classmethod
+        def _process_pwdproperties(cls, pwdproperties):
+            '''
+            Take an string representation of integer comprised of bit flags from:
+
+            https://msdn.microsoft.com/en-us/library/ms679431(v=vs.85).aspx
+
+            and return dict of each setting and corresponding boolean value.
+            '''
+            properties_int = int(pwdproperties)
+            properties_dict = dict()
+            for (key, value) in cls._pwdproperties_options.iteritems():
+                properties_dict[key] = True if properties_int & value else False
+            return properties_dict
+
+
+    class GranularPasswordPolicy(PasswordPolicy):
+        '''
+        Fine Grained Password Policy (fgpp):
+        - LDAP objectclass: https://msdn.microsoft.com/en-us/library/hh338661(v=vs.85).aspx
+
+        Requires domain functional level 2008+ (requires all 2008+ DCs).
+        '''
+
+        _attribute_map = dict(password_min_length='msDS-MinimumPasswordLength',
+                              password_min_age='msDS-MinimumPasswordAge',
+                              password_max_age='msDS-MaximumPasswordAge',
+                              password_history_length='msDS-PasswordHistoryLength',
+                              password_complexity_enforced='msDS-PasswordComplexityEnabled',
+                              password_cleartext_available='msDS-PasswordReversibleEncryptionEnabled',
+                              authfail_lockout_threshold='msDS-LockoutThreshold',
+                              authfail_lockout_window='msDS-LockoutObservationWindow',
+                              authfail_lockout_duration='msDS-LockoutDuration')
