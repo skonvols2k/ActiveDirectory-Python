@@ -3,6 +3,9 @@ import ldap
 
 # Internal Dependencies
 from datetime import timedelta, datetime
+from collections import OrderedDict
+import struct
+import itertools
 import pytz
 import re
 
@@ -36,12 +39,34 @@ class ActiveDirectoryPasswordController(object):
             'lastLogonTimestamp': 2,
             'lockoutTime': 0,
             'accountExpires': 0,
+            'msDS-UserPasswordExpiryTimeComputed': 3,
             'msDS-User-Account-Control-Computed': 2,
             'logonHours': 0,
             'userWorkstations': 0,
             'msDS-ResultantPSO': 3,
             'msDS-FailedInteractiveLogonCount': 3,
             'msDS-FailedInteractiveLogonCountAtLastSuccessfulLogon': 3}
+
+    # https://msdn.microsoft.com/en-us/library/ms679637(v=vs.85).aspx
+    _samaccounttype_map = dict(
+            SAM_DOMAIN_OBJECT=0x0,
+            SAM_GROUP_OBJECT=0x10000000,
+            SAM_NON_SECURITY_GROUP_OBJECT=0x10000001,
+            SAM_ALIAS_OBJECT=0x20000000,
+            SAM_NON_SECURITY_ALIAS_OBJECT=0x20000001,
+            SAM_USER_OBJECT=0x30000000,
+            SAM_NORMAL_USER_ACCOUNT=0x30000000,
+            SAM_MACHINE_ACCOUNT=0x30000001,
+            SAM_TRUST_ACCOUNT=0x30000002,
+            SAM_APP_BASIC_GROUP=0x40000000,
+            SAM_APP_QUERY_GROUP=0x40000001,
+            SAM_ACCOUNT_TYPE_MAX=0x7fffffff)
+
+    _absolute_interval_attributes = [
+            'accountExpires',
+            'lastLogonTimestamp',
+            'msDS-UserPasswordExpiryTimeComputed',
+            'pwdLastSet']
 
     def __init__(self, ldap_obj, ldap_base=''):
         self.ldap_obj = ldap_obj
@@ -72,29 +97,57 @@ class ActiveDirectoryPasswordController(object):
         ldap_filter = '(samaccountname={0})'.format(username)
         result = self.ldap_obj.search_s(self.ldap_base, ldap.SCOPE_SUBTREE, ldap_filter, attrlist=available_attributes)
         (dn, attributes) = next(self._flattened_result_generator(result))
-        print dn, attributes
+        user_info = self._process_user_info(attributes)
         return attributes
 
     # "Helper" functions follow. They don't need instantiated class.
     @classmethod
+    def _process_user_info(cls, user_info):
+        '''
+        Attributes that need extra processing, if present:
+            - absolute interval attributes
+            - logonHours
+            - sAMAccountType
+
+        TODO: This mapping could/should be controlled in a dict.
+        '''
+        for key in set(cls._absolute_interval_attributes) & set(user_info.iterkeys()):
+            user_info[key] = cls._absolute_adinterval_to_datetime(user_info[key])
+        user_info['logonHours'] = cls._parse_logonhours(user_info['logonHours'])
+        user_info['sAMAccountType'] = cls._parse_samaccounttype(user_info['sAMAccountType'])
+
+    @classmethod
+    def _parse_samaccounttype(cls, samaccounttype):
+        samaccounttype_map_inv = dict((sam_type, sam_name) for (sam_name, sam_type) in cls._samaccounttype_map.iteritems())
+        return samaccounttype_map_inv[int(samaccounttype)]
+
+    @classmethod
     def _parse_logonhours(cls, logonhours):
         '''
-        http://blogs.msmvps.com/richardsiddaway/2008/08/18/ad-logon-hours/
+        From: https://anlai.wordpress.com/2010/09/07/active-directory-permitted-logon-times-with-c-net-3-5-using-system-directoryservices-accountmanagement/
+            - logonhours is 21-byte field.
+            - Each day of the week is 3 bytes.
+            - Each hour is 1 bit.
+            - The first byte is actually Saturday 1600 - 0000, swap with last byte.
 
-        logonhours is 21-byte field.
-        Each day of the week is 3 bytes.
-        Each hour is 1 bit.
-
-        itertools.izip(u, itertools.islice(u, 1, None), itertools.islice(u, 2, None))
-        struct.unpack('21B', warden['logonHours'])
+        Python 2.7 or RHEL/CentOS python-libs >= 2.6.6-43 has required collections.OrderedDict.
         '''
-        byte_tup = strcut.unpack('21B', logonhours)
+        byte_list = list(struct.unpack('21B', logonhours))
+        byte_list[0] = byte_list[0] ^ byte_list[20]
+        byte_list[20] = byte_list[0] ^ byte_list[20]
+        byte_list[0] = byte_list[0] ^ byte_list[20]
         weekdays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
         hour_masks = [2**i for i in xrange(24)]  # every bit in 3 bytes
+        logonhours_dict = OrderedDict()
         for day in weekdays:
-            for (morning, midday, evening) in itertools.izip(byte_tup, itertools.islice(byte_tup, 1, None), itertools.islice(byte_tup, 2, None)):
-                hours = morning | (midday << 8) | (evening << 16)
-        pass
+            for (morning, midday, evening) in itertools.izip(byte_list, itertools.islice(byte_list, 1, None), itertools.islice(byte_list, 2, None)):
+                logonhours_today = morning | (midday << 8) | (evening << 16)
+                logonhours_dict[day] = dict()
+                today = logonhours_dict[day]
+                for hour in xrange(24):
+                    today[hour] = True if logonhours_today & hour_masks[hour] else False
+        return logonhours_dict
+
 
     @classmethod
     def _get_available_attributes(cls, attribute_level_dict, domainlevel_int):
@@ -487,104 +540,6 @@ class ActiveDirectoryPasswordController(object):
 		if code == '775':
 			return self.authn_failure_acct_locked(user_dn, self.uri)
 
-	# Exceptions
-	class authn_failure(Exception):
-		def __init__(self, user_dn, host):
-			self.user_dn = user_dn
-			self.host = host
-			self.msg = 'user_dn="%s" host="%s" incorrect current password or generic authn failure' % (user_dn, host)
-		def __str__(self):
-			return str(self.msg)
-
-	class authn_failure_time(Exception):
-		def __init__(self, user_dn, host):
-			self.user_dn = user_dn
-			self.host = host
-			self.msg = 'user_dn="%s" host="%s" user_dn has time of day login restrictions and cannot login at this time' % (user_dn, host)
-		def __str__(self):
-			return str(self.msg)
-
-	class authn_failure_workstation(Exception):
-		def __init__(self, user_dn, host):
-			self.user_dn = user_dn
-			self.host = host
-			self.msg = 'user_dn="%s" host="%s" user_dn has workstation login restrictions and cannot login at this workstation' % (user_dn, host)
-		def __str__(self):
-			return str(self.msg)
-
-	class authn_failure_pwd_expired_natural(Exception):
-		def __init__(self, user_dn, host):
-			self.user_dn = user_dn
-			self.host = host
-			self.msg = 'user_dn="%s" host="%s" user_dn\'s password has expired naturally' % (user_dn, host)
-		def __str__(self):
-			return str(self.msg)
-
-	class authn_failure_pwd_expired_admin(Exception):
-		def __init__(self, user_dn, host):
-			self.user_dn = user_dn
-			self.host = host
-			self.msg = 'user_dn="%s" host="%s" user_dn\'s password has been administratively expired (force change on next login)' % (user_dn, host)
-		def __str__(self):
-			return str(self.msg)
-
-	class authn_failure_acct_disabled(Exception):
-		def __init__(self, user_dn, host):
-			self.user_dn = user_dn
-			self.host = host
-			self.msg = 'user_dn="%s" host="%s" user_dn account disabled' % (user_dn, host)
-		def __str__(self):
-			return str(self.msg)
-
-	class authn_failure_acct_expired(Exception):
-		def __init__(self, user_dn, host):
-			self.user_dn = user_dn
-			self.host = host
-			self.msg = 'user_dn="%s" host="%s" user_dn account expired' % (user_dn, host)
-		def __str__(self):
-			return str(self.msg)
-	
-	class authn_failure_acct_locked(Exception):
-		def __init__(self, user_dn, host):
-			self.user_dn = user_dn
-			self.host = host
-			self.msg = 'user_dn="%s" host="%s" user_dn account locked due to excessive authentication failures' % (user_dn, host)
-		def __str__(self):
-			return str(self.msg)
-
-	class user_not_found(Exception):
-		def __init__(self, user):
-			self.msg = 'Could not locate user %s.' % (user)
-		def __str__(self):
-			return str(self.msg)
-
-	class user_protected(Exception):
-		def __init__(self, user):
-			self.msg = '%s is a protected user; their password cannot be changed using this tool.' % (user)
-		def __str__(self):
-			return str(self.msg)
-
-	class user_cannot_change_pwd(Exception):
-		def __init__(self, user, status, can_change_pwd_states):
-			self.status = status
-			self.msg = '%s cannot change password for the following reasons: %s' % (user, ', '.join((set(status['acct_bad_states']) - set(can_change_pwd_states))))
-		def __str__(self):
-			return str(self.msg.rstrip() + '.')
-
-	class pwd_vette_failure(Exception):
-		def __init__(self, user, new_pwd, msg, status):
-			self.user = user
-			self.new_pwd = new_pwd
-			self.msg = msg
-			self.status = status
-		def __str__(self):
-			return str(self.msg)
-
-	class ldap_error(ldap.LDAPError):
-		def __init__(self, e):
-			self.msg = 'LDAP Error. desc: %s info: %s' % (e[0]['desc'], e[0]['info'])
-		def __str__(self):
-			return str(self.msg)
 
     class PasswordPolicy(object):
         '''
