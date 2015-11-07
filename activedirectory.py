@@ -19,6 +19,55 @@ class ActiveDirectoryLDAPConnection(ReconnectLDAPObject, object):
             WIN2008=3,
             WIN2008R2=4)
 
+    class INVALID_CREDENTIALS(ldap.INVALID_CREDENTIALS):
+        # Code 49 (Invalid Credentials) Data Codes: http://www-01.ibm.com/support/docview.wss?uid=swg21290631
+        INVALID_CREDENTIALS_MAP = {
+                '525': 'user_not_found',  # This does not get returned when you bind with invalid user_dn.
+                '530': 'login_time_restricted',
+                '531': 'login_workstation_restricted',
+                '52e': 'password_incorrect',
+                '532': 'password_expired_natural',
+                '733': 'password_expired_forced',
+                '533': 'account_disabled',
+                '701': 'account_expired',
+                '775': 'account_locked'}
+
+        # These are user-configurable and should probably go elsewhere.
+        PASSWORD_CHANGE_ALLOWED = [
+                'password_expired_natural',
+                'password_expired_forced']
+
+
+        def __init__(self, e):
+            super(ActiveDirectoryLDAPConnection.INVALID_CREDENTIALS, self).__init__(*e.args)
+            self.ad_reason = self._parse_invalid_credentials()
+            self.ad_can_change_password = True if self.ad_reason in self.PASSWORD_CHANGE_ALLOWED else False
+            self.args[0]['ad_reason'] = self.ad_reason
+            self.args[0]['ad_can_change_password'] = self.ad_can_change_password
+
+        def _parse_invalid_credentials(self):
+            '''
+            Attempt to get additional information from an ldap.INVALID_CREDENTIALS.
+            AD returns a specific string with additional information after 'data'.
+            The codes are detailed here: http://www-01.ibm.com/support/docview.wss?uid=swg21290631
+            '''
+            ldapcode_pattern = r'.*AcceptSecurityContext error, data (?P<ldapcode>[^,]+),'
+            try:
+                ldapcode_errstr = self.args[0]['info']
+            except (IndexError, KeyError) as e:
+                return 'Failed to find info key in {0}'.format(self.args)
+            m = re.match(ldapcode_pattern, ldapcode_errstr)
+            try:
+                ldapcode = m.group('ldapcode')
+            except (AttributeError, IndexError) as e:
+                return 'Failed to parse code from {0}'.format(ldapcode_errstr)
+            try:
+                description = self.INVALID_CREDENTIALS_MAP[ldapcode]
+            except KeyError:
+                return 'Code {0} invalid per http://www-01.ibm.com/support/docview.wss?uid=swg21290631'.format(ldapcode)
+            return description
+
+
     def __init__(self, *args, **kwargs):
         '''
         All args/kwargs except ldap_base are passed to ldap.ldapobject.ReconnectLDAPObject.
@@ -32,6 +81,31 @@ class ActiveDirectoryLDAPConnection(ReconnectLDAPObject, object):
         self.domainlevel = self._get_domainlevel_str(self._domainlevel_int)
         self.ldap_base = ldap_base or self.rootdse.get('defaultNamingContext')
 
+    def authenticate(self, user_dn, password):
+        try:
+           self.simple_bind_s(user_dn, password)
+        except ldap.INVALID_CREDENTIALS as e:
+            raise self.INVALID_CREDENTIALS(e)
+        return True
+
+    def get_user(self, username, ldap_base=''):
+        available_attributes = DomainUser._get_available_attributes(DomainUser.ATTRIBUTE_LEVEL_MAP, self)
+        ldap_filter = '(samaccountname={0})'.format(username)
+        ldap_base = ldap_base or self.ldap_base
+        result = self.search_s(ldap_base, ldap.SCOPE_SUBTREE, ldap_filter, attrlist=available_attributes)
+        (user_dn, user_dict) = next(self._flattened_result_generator(result))
+        return DomainUser(user_dict, user_dn)
+
+    def change_user_password(self, username, current_password, new_password, ldap_base=''):
+        user = self.get_user(username, ldap_base)
+        # Preserve bind credentials, authn user on new LDAP connection.
+        user_adldap_obj = ActiveDirectoryLDAPConnection(self._uri, ldap_base)
+        try:
+            adldap_obj.authenticate(user.user_dn, current_password)
+        except ActiveDirectoryLDAPConnection.INVALID_CREDENTIALS as e:
+            if not e.ad_can_change_password:
+                raise e
+        # current_password is correct although possibly expired.
     def _get_rootdse(self):
         '''
         Query the Root DSE (blank search base, base scope, no authn required).
@@ -50,6 +124,7 @@ class ActiveDirectoryLDAPConnection(ReconnectLDAPObject, object):
         return True if int(self._domainlevel_int) >= self._domainFunctionality_map[domainlevel_str] else False
 
     # "Helper" methods follow. They don't need instantiated class.
+
     @classmethod
     def _get_domainlevel_str(cls, level_int):
         '''
@@ -563,21 +638,9 @@ class GranularPasswordPolicy(PasswordPolicy):
         return policies
 
 class DomainUser(object):
-    # Code 49 (Invalid Credentials) Data Codes: http://www-01.ibm.com/support/docview.wss?uid=swg21290631
-    _invalid_credentials_codes = dict(
-            user_not_found='525',
-            login_time_restricted='530',
-            login_workstation_restricted='531',
-            password_incorrect='52e',
-            password_expired_natural='532',
-            password_expired_forced='733',
-            account_disabled='533',
-            account_expired='701',
-            account_locked='775')
-
     # What user attributes do we want and in what domain levels of AD are they available
     # I broke the dict() convention since some keys have '-' characters.
-    _user_attribute_level_map = {
+    ATTRIBUTE_LEVEL_MAP = {
             'sAMAccountName': 'WIN2000',
             'sAMAccountType': 'WIN2000',
             'pwdLastSet': 'WIN2000',
@@ -595,7 +658,7 @@ class DomainUser(object):
 
     # https://msdn.microsoft.com/en-us/library/ms677840(v=vs.85).aspx and
     # https://msdn.microsoft.com/en-us/library/ms680832(v=vs.85).aspx
-    _useraccountcontrol_map = dict(
+    USERFLAGS_MAP = dict(
             UF_SCRIPT=0x00000001,
             UF_ACCOUNTDISABLE=0x00000002,
             UF_HOMEDIR_REQUIRED=0x00000008,
@@ -624,7 +687,7 @@ class DomainUser(object):
     # TODO: parse msDS-SupportedEncryptionTypes
 
     # https://msdn.microsoft.com/en-us/library/ms679637(v=vs.85).aspx
-    _samaccounttype_map = dict(
+    SAMACCOUNTTYPE_MAP = dict(
             SAM_DOMAIN_OBJECT=0x0,
             SAM_GROUP_OBJECT=0x10000000,
             SAM_NON_SECURITY_GROUP_OBJECT=0x10000001,
@@ -638,22 +701,19 @@ class DomainUser(object):
             SAM_APP_QUERY_GROUP=0x40000001,
             SAM_ACCOUNT_TYPE_MAX=0x7fffffff)
 
-    _absolute_interval_attributes = [
+    ABSOLUTE_INTERVAL_ATTRIBUTES = [
             'accountExpires',
             'lastLogonTimestamp',
             'msDS-UserPasswordExpiryTimeComputed',
-            'lockoutTime'
+            'lockoutTime',
             'pwdLastSet']
 
-    def __init__(self, user_dict, user_dn, adldap_obj):
+    def __init__(self, user_dict, user_dn):
         self._user_raw = dict(user_dict)  # copy
         self.user_dn = user_dn
-        self.adldap_obj = adldap_obj
-        self._available_attributes = self._get_available_attributes(self._user_attribute_level_map, adldap_obj)
-        for (key) in self._available_attributes:
-            value = user_dict.get(key, None)
+        for (key, value) in user_dict.iteritems():
             if value is not None:
-                if key in self._absolute_interval_attributes:
+                if key in self.ABSOLUTE_INTERVAL_ATTRIBUTES:
                     value = ActiveDirectoryAttribute._absolute_adinterval_to_datetime(value)
                 if key == 'logonHours':
                     value = self._parse_logonhours(value)
@@ -674,64 +734,19 @@ class DomainUser(object):
     def __str__(self):
         return str(self.user_dict)
 
-    def authenticate(self, password):
-        ldap_obj = ReconnectLDAPObject(self.ldap_obj._uri)
-        try:
-            ldap_obj.simple_bind_s(self.user_dn, password)
-		except ldap.INVALID_CREDENTIALS as e:
-            # e contains more info as to what failed
-            reason = self._parse_invalid_credentials(e)
-            pass
 
-    @classmethod
-    def get_user(cls, adldap_obj, username, ldap_base=''):
-        available_attributes = cls._get_available_attributes(cls._user_attribute_level_map, adldap_obj)
-        ldap_filter = '(samaccountname={0})'.format(username)
-        ldap_base = ldap_base or adldap_obj.ldap_base
-        result = adldap_obj.search_s(ldap_base, ldap.SCOPE_SUBTREE, ldap_filter, attrlist=available_attributes)
-        (dn, attributes) = next(adldap_obj._flattened_result_generator(result))
-        return cls(attributes, dn, adldap_obj)
-
-
-    @classmethod
-	def _parse_invalid_credentials(cls, e, user_dn):
-		ldapcode_pattern = r'.*AcceptSecurityContext error, data (?P<ldapcode>[^,]+),'
-        ldapcode_errstr = e[0]['info']
-		m = re.match(ldapcode_pattern, ldapcode_errstr)
-		if not m or not len(m.groups()) > 0 or m.group('ldapcode') not in ldapcodes:
-			return 'Could not determine LDAP error subcode'
-		ldapcode = m.group('ldapcode')
-        for (description, code) in cls._invalid_credentials_codes.iteritems():
-		if code == '525':
-			return self.user_not_found(user_dn, code)
-		if code == '52e':
-			return self.authn_failure(user_dn, self.uri)
-		if code == '530':
-			return self.authn_failure_time(user_dn, self.uri)
-		if code == '531':
-			return self.authn_failure_workstation(user_dn, self.uri)
-		if code == '532':
-			return self.authn_failure_pwd_expired_natural(user_dn, self.uri)
-		if code == '533':
-			return self.authn_failure_acct_disabled(user_dn, self.uri)
-		if code == '701':
-			return self.authn_failure_acct_expired(user_dn, self.uri)
-		if code == '773':
-			return self.authn_failure_pwd_expired_admin(user_dn, self.uri)
-		if code == '775':
-			return self.authn_failure_acct_locked(user_dn, self.uri)
 
     @classmethod
     def _parse_useraccountcontrol(cls, uac):
         uac_int = int(uac)
         uac_dict = dict()
-        for (flag, value) in cls._useraccountcontrol_map.iteritems():
+        for (flag, value) in cls.USERFLAGS_MAP.iteritems():
             uac_dict[flag] = True if uac_int & value else False
         return uac_dict
 
     @classmethod
     def _parse_samaccounttype(cls, samaccounttype):
-        samaccounttype_map_inv = dict((sam_type, sam_name) for (sam_name, sam_type) in cls._samaccounttype_map.iteritems())
+        samaccounttype_map_inv = dict((sam_type, sam_name) for (sam_name, sam_type) in cls.SAMACCOUNTTYPE_MAP.iteritems())
         return samaccounttype_map_inv[int(samaccounttype)]
 
     @classmethod
