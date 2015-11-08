@@ -75,18 +75,24 @@ class ActiveDirectoryLDAPConnection(ReconnectLDAPObject, object):
         New cls class object is returned with created ldapobject and ldap_base.
         '''
         ldap_base = kwargs.pop('ldap_base', '')
+        bind_dn = kwargs.pop('bind_dn', '')
+        bind_password = kwargs.pop('bind_password', '')
         super(ActiveDirectoryLDAPConnection, self).__init__(*args, **kwargs)
         self.rootdse = self._get_rootdse()
         self._domainlevel_int = int(self.rootdse.get('domainFunctionality', '0'))
         self.domainlevel = self._get_domainlevel_str(self._domainlevel_int)
         self.ldap_base = ldap_base or self.rootdse.get('defaultNamingContext')
+        self.domain_password_policy = None
+        self.granular_password_policies = None
+        if bind_dn and bind_password:
+            self.authenticate(bind_dn, bind_password)
+            self.load_all_password_policies()
 
     def authenticate(self, user_dn, password):
         try:
            self.simple_bind_s(user_dn, password)
         except ldap.INVALID_CREDENTIALS as e:
             raise self.INVALID_CREDENTIALS(e)
-        return True
 
     def get_user(self, username, ldap_base=''):
         available_attributes = DomainUser._get_available_attributes(DomainUser.ATTRIBUTE_LEVEL_MAP, self)
@@ -96,16 +102,14 @@ class ActiveDirectoryLDAPConnection(ReconnectLDAPObject, object):
         (user_dn, user_dict) = next(self._flattened_result_generator(result))
         return DomainUser(user_dict, user_dn)
 
-    def change_user_password(self, username, current_password, new_password, ldap_base=''):
-        user = self.get_user(username, ldap_base)
-        # Preserve bind credentials, authn user on new LDAP connection.
-        user_adldap_obj = ActiveDirectoryLDAPConnection(self._uri, ldap_base)
+    def load_all_password_policies(self):
         try:
-            adldap_obj.authenticate(user.user_dn, current_password)
-        except ActiveDirectoryLDAPConnection.INVALID_CREDENTIALS as e:
-            if not e.ad_can_change_password:
-                raise e
-        # current_password is correct although possibly expired.
+            self.domain_password_policy = DomainPasswordPolicy.get_policy(self)
+            self.granular_password_policies = GranularPasswordPolicy.get_all_policies(self)
+        except ldap.OPERATIONS_ERROR as e:
+            # Not bound or not bound as someone who can read fgpp.
+            pass
+
     def _get_rootdse(self):
         '''
         Query the Root DSE (blank search base, base scope, no authn required).
@@ -415,7 +419,7 @@ class ActiveDirectoryAttribute(object):
 
         :param adinterval: string of negative long int representing 100-nanosecond intervals
         '''
-        relative_never = [-0x8000000000000000]
+        relative_never = [0, -0x8000000000000000]
         adinterval_int = int(adinterval)
         if adinterval_int in relative_never:
             return None
@@ -438,6 +442,24 @@ class ActiveDirectoryAttribute(object):
         delta = cls._relative_adinterval_to_timedelta(adinterval)
         ad_epoch = datetime(1601, 1, 1, tzinfo=pytz.utc)
         return ad_epoch + delta
+
+    @classmethod
+    def _string_to_boolean(cls, bool_str):
+        '''
+        Returns boolean value of string, accepting true/false, t/f, or 0/1
+        '''
+        string_true = ['true', 't', '1']
+        string_false = ['false', 'f', '0']
+        string_boolean = string_true + string_false
+        bool_str = str(bool_str).lower()
+        if bool_str not in string_boolean:
+            raise ValueError('%s not boolean string. (true/false, t/f, 0/1)' % (value))
+        return bool_str in string_true
+
+    @classmethod
+    def _password_to_utf16le(cls, password):
+        return unicode('\"' + password + '\"').encode('utf-16-le')
+
 
 class PasswordPolicy(object):
     '''
@@ -482,19 +504,72 @@ class PasswordPolicy(object):
             if value is not None and policy_key in self._numeric_attributes:
                 value = int(value)
             if value is not None and policy_key in self._boolean_attributes:
-                value = self._string_to_boolean(value)
+                value = ActiveDirectoryAttribute._string_to_boolean(value)
             if value is not None and policy_key in self._relative_interval_attributes:
                 value = ActiveDirectoryAttribute._relative_adinterval_to_timedelta(value)
             setattr(self, policy_key, value)
         self.policy_dn = policy_dn
 
     def __repr__(self):
-        return '{0} for {1}'.format(self.__class__.__name__, self.policy_dn)
+        return '<{0} for {1} at 0x{2:x}>'.format(self.__class__.__name__, self.policy_dn, id(self))
 
     def __str__(self):
         policy = dict((policy_key, getattr(self, policy_key)) for policy_key in self._attribute_map.iterkeys())
         policy['policy_dn'] = self.policy_dn
         return str(policy)
+
+    def validate_password(self, password, username, displayname):
+        '''
+        Complexity and length are what we can check for here.
+
+        TODO: Check password minimum age. Tricky since we also need user pwdLastSet.
+
+        Raises ValueError if password does not validate.
+        '''
+        if len(password) < self.password_min_length:
+            raise ValueError('Password must be at least {0} characters.'.format(self, self.password_min_length))
+
+        if self.password_complexity_enforced:
+            self.validate_complexity(password, username, displayname)
+
+    @classmethod
+    def validate_complexity(cls, password, username, displayname):
+        '''
+        Complexity Rules: https://technet.microsoft.com/en-us/library/cc786468(v=ws.10).aspx
+            - If sAMAccountName is longer than 2 characters, it cannot be a part of the password (case insensitive).
+            - If a tokenized segment of displayName is longer than 2 characters, it cannot be part of the password (case insensitive).
+                - Token delimiters: ,.-_ #\t
+            - The password must contain 3 of 5 character classes:
+                - Uppercase
+                - Lowercase
+                - Number
+                - Non-alphanumeric: ~!@#$%^&*_-+=`|\(){}[]:;"'<>,.?/
+                - Unicode categorized as alpha but not upper or lowercase. (Unicode from Asian languages)
+                    - This class is not currently implemented.
+        '''
+        username = username.lower()
+        if len(username) > 2 and username in password.lower():
+            raise ValueError('Usernames longer than 2 characters ({0}) cannot be part of a password.'.format(username))
+
+        token_chars = ',.-_ #\t'
+        split_pattern = '[{0}]+(?i)'.format(token_chars)  # account for re.split case-sensitivity
+        displayname_tokenized = [token for token in re.split(split_pattern, displayname) if len(token) > 2]
+        for token in displayname_tokenized:
+            if token.lower() in password.lower():
+                raise ValueError('Parts of your display name longer than 2 characters ({0}) cannot be part of a password.'.format(token))
+
+        patterns = [r'(?P<digit>[0-9])', r'(?P<lowercase>[a-z])', r'(?P<uppercase>[A-Z])', r'(?P<non_alphanumeric>[~!@#$%^&*_\-+=`|\\(){}\[\]:;"\'<>,.?/])']
+        matches = []
+        for pattern in patterns:
+            match = re.search(pattern, password)
+            try:
+                matches.append(match.groupdict().keys()[0])
+            except AttributeError:
+                # No match!
+                pass
+        if len(matches) < 3:
+            raise ValueError('Password must contain 3 or 4 character types (lowercase, uppercase, digit, non_alphanumeric), only found {0}.'.format(', '.join(matches)))
+
 
     @classmethod
     def get_policy(cls, adldap_obj, policy_dn):
@@ -507,20 +582,6 @@ class PasswordPolicy(object):
         if not policy_dict:
             return None  # raise exception?
         return cls(policy_dict, policy_dn)
-
-    # Perhaps this should go elsewhere?
-    @classmethod
-    def _string_to_boolean(cls, bool_str):
-        '''
-        Returns boolean value of string, accepting true/false, t/f, or 0/1
-        '''
-        string_true = ['true', 't', '1']
-        string_false = ['false', 'f', '0']
-        string_boolean = string_true + string_false
-        bool_str = str(bool_str).lower()
-        if bool_str not in string_boolean:
-            raise ValueError('%s not boolean string. (true/false, t/f, 0/1)' % (value))
-        return bool_str in string_true
 
 
 class DomainPasswordPolicy(PasswordPolicy):
@@ -622,7 +683,6 @@ class GranularPasswordPolicy(PasswordPolicy):
         Make sure we can query fgpp container, then load all its child policies.
         '''
         if not cls._is_fgpp_supported(adldap_obj):
-            print 'Fine Grained Password Policies not supported on your effective domain level.'
             return None
         ldap_base = ldap_base or adldap_obj.ldap_base
         fgpp_container_base = 'cn=Password Settings Container,cn=System,{0}'.format(ldap_base)
@@ -643,6 +703,7 @@ class DomainUser(object):
     ATTRIBUTE_LEVEL_MAP = {
             'sAMAccountName': 'WIN2000',
             'sAMAccountType': 'WIN2000',
+            'displayName': 'WIN2000',
             'pwdLastSet': 'WIN2000',
             'lockoutTime': 'WIN2000',
             'accountExpires': 'WIN2000',
@@ -735,6 +796,47 @@ class DomainUser(object):
         return str(self.user_dict)
 
 
+    def change_password(self, current_password, new_password, adldap_obj):
+        '''
+        Details: https://msdn.microsoft.com/en-us/library/cc223248.aspx
+            - User can delete/add unicodePwd with current_password and new_password.
+            - Priv'd user can replace unicodePwd with new_password.
+
+        Result codes:
+			00000056 - Current passwords do not match
+			0000052D - New password violates length/complexity/history
+        '''
+        # Preserve bind credentials, authn user on new LDAP connection.
+        user_adldap_obj = ActiveDirectoryLDAPConnection(adldap_obj._uri)
+        try:
+            user_adldap_obj.authenticate(self.user_dn, current_password)
+        except ActiveDirectoryLDAPConnection.INVALID_CREDENTIALS as e:
+            if not e.ad_can_change_password:
+                raise e
+        # current_password is correct.
+        user_pso = self.get_user_password_policy(adldap_obj)
+        user_pso.validate_password(new_password, self.user_dict['sAMAccountName'], self.user_dict['displayName'])
+        # new_password is valid.
+        old_entry = dict(unicodePwd=ActiveDirectoryAttribute._password_to_utf16le(current_password))
+        new_entry = dict(unicodePwd=ActiveDirectoryAttribute._password_to_utf16le(new_password))
+        change_modlist = ldap.modlist.modifyModlist(old_entry, new_entry)
+        try:
+            adldap_obj.modify_s(self.user_dn, change_modlist)
+        except ldap.CONSTRAINT_VIOLATION as e:
+            if e[0]['info'].startswith('0000052D'):
+                # Password failed policy constraint - password_min_age or password_history_length
+                raise ValueError('Server rejected new password, likely because it was used within the past {0} passwords.'.format(user_pso.password_history_length))
+            raise e
+
+    def get_user_password_policy(self, adldap_obj):
+        '''
+        Prefer msDS-ResultantPSO, fall back to domain policy.
+        '''
+        user_pso = self.user_dict.get('msDS-ResultantPSO', None)
+        if user_pso:
+            return adldap_obj.granular_password_policies[user_pso]
+        else:
+            return adldap_obj.domain_password_policy
 
     @classmethod
     def _parse_useraccountcontrol(cls, uac):
@@ -775,7 +877,6 @@ class DomainUser(object):
                 for hour in xrange(24):
                     today[hour] = True if logonhours_today & hour_masks[hour] else False
         return logonhours_dict
-
 
     @classmethod
     def _get_available_attributes(cls, attribute_level_dict, adldap_obj):
