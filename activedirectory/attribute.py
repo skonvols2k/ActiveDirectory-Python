@@ -97,11 +97,11 @@ class ActiveDirectoryAttribute(object):
         string_boolean = string_true + string_false
         bool_str = str(bool_str).lower()
         if bool_str not in string_boolean:
-            raise ValueError('%s not boolean string. (true/false, t/f, 0/1)' % (value))
+            raise ValueError('{0} not boolean string. (true/false, t/f, 0/1)'.format(bool_str))
         return bool_str in string_true
 
     @classmethod
-    def password_to_utf16le(cls, password):
+    def string_to_utf16le(cls, password):
         return unicode('\"' + password + '\"').encode('utf-16-le')
     
     @classmethod
