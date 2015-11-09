@@ -1,3 +1,6 @@
+from .attribute import ActiveDirectoryAttribute
+
+import ldap  # TODO: I'm not sure if classes in this module should be using ldap directly.
 import re
 
 import logging
@@ -225,7 +228,7 @@ class GranularPasswordPolicy(PasswordPolicy):
         '''
         Return true if Fine-Grained Password Policies are supported, false otherwise.
         '''
-        return adldap_obj._check_domainlevel('WIN2008')
+        return adldap_obj.check_domainlevel('WIN2008')
 
     @classmethod
     def get_all_policies(cls, adldap_obj, ldap_base=''):

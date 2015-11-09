@@ -1,3 +1,6 @@
+from .password_policy import DomainPasswordPolicy, GranularPasswordPolicy
+from .user import DomainUser
+
 import ldap
 from ldap.ldapobject import ReconnectLDAPObject
 import re
@@ -56,7 +59,7 @@ class ActiveDirectoryLDAPConnection(ReconnectLDAPObject, object):
             # Not bound or not bound as someone who can read fgpp.
             pass
 
-    def search_s_flatgen(*args, **kwargs):
+    def search_s_flatgen(self, *args, **kwargs):
         result = self.search_s(*args, **kwargs)
         return self._flattened_result_generator(result)
 

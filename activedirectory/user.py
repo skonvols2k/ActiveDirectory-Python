@@ -1,3 +1,5 @@
+from .attribute import ActiveDirectoryAttribute
+
 import logging
 logger = logging.getLogger(__name__)
 
@@ -71,8 +73,8 @@ class DomainUser(object):
         user_pso = self.get_user_password_policy(adldap_obj)
         user_pso.validate_password(new_password, self.user_dict['sAMAccountName'], self.user_dict['displayName'])
         # new_password should be valid.
-        old_entry = dict(unicodePwd=ActiveDirectoryAttribute.password_to_utf16le(current_password))
-        new_entry = dict(unicodePwd=ActiveDirectoryAttribute.password_to_utf16le(new_password))
+        old_entry = dict(unicodePwd=ActiveDirectoryAttribute.string_to_utf16le(current_password))
+        new_entry = dict(unicodePwd=ActiveDirectoryAttribute.string_to_utf16le(new_password))
         password_modlist = ldap.modlist.modifyModlist(old_entry, new_entry)
         try:
             adldap_obj.modify_s(self.user_dn, password_modlist)
@@ -89,6 +91,7 @@ class DomainUser(object):
         user_pso.validate_password(new_password, self.user_dict['sAMAccountName'], self.user_dict['displayName'])
         # new_password should be valid.
         new_password = ActiveDirectoryAttribute.password_to_utf16le(new_password)
+        # I don't know how to generate a MOD_REPLACE modlist except by hand.
         password_modlist = [(ldap.MOD_REPLACE, 'unicodePwd', [new_password])]
         try:
             adldap_obj.modify_s(self.user_dn, password_modlist)
@@ -98,6 +101,8 @@ class DomainUser(object):
     def get_user_password_policy(self, adldap_obj):
         '''
         Prefer msDS-ResultantPSO, fall back to domain policy.
+
+        TODO: Make less fragile - expects adldap_obj to have policies loaded.
         '''
         user_pso = self.user_dict.get('msDS-ResultantPSO', None)
         if user_pso:
@@ -109,6 +114,6 @@ class DomainUser(object):
     def _get_available_attributes(cls, attribute_level_dict, adldap_obj):
         available_attributes = list()
         for (attribute, level) in attribute_level_dict.iteritems():
-            if adldap_obj._check_domainlevel(level):
+            if adldap_obj.check_domainlevel(level):
                 available_attributes.append(attribute)
         return available_attributes
