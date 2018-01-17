@@ -144,15 +144,30 @@ class activedirectory:
 		if self.is_admin(user_dn):
 			raise self.user_protected(user)
 		if status['acct_pwd_expiry_enabled']:
-			mod = [(ldap.MOD_REPLACE, 'pwdLastSet', [0])]
+			mod = [(ldap.MOD_REPLACE, 'pwdLastSet', "0")]
 			try:
 				self.conn.modify_s(user_dn, mod)
 			except ldap.LDAPError, e:
 				raise self.ldap_error(e)
 
+	def force_unlock(self, user):
+		# They must exist, not be priv'd
+		status = self.get_user_status(user)
+		user_dn = status['user_dn']
+		if self.is_admin(user_dn):
+			raise self.user_protected(user)
+		if status['acct_locked']:
+			#mod = [(ldap.MOD_REPLACE, 'badPwdCount', '0'),(ldap.MOD_REPLACE, 'lockoutTime', '0')]
+			mod = [(ldap.MOD_REPLACE, 'lockoutTime', '0')]
+			try:
+				self.conn.modify_s(user_dn, mod)
+			except ldap.LDAPError, e:
+				raise self.ldap_error(e)
+
+
 	def get_user_status(self, user):
-		user_base = "CN=Users,%s" % (self.base)
-		user_filter = "(sAMAccountName=%s)" % (user)
+		user_base = '%s' % (self.base)
+		user_filter = '(sAMAccountName=%s)' % (user)
 		user_scope = ldap.SCOPE_SUBTREE
 		status_attribs = ['pwdLastSet', 'accountExpires', 'userAccountControl', 'memberOf', 'msDS-User-Account-Control-Computed', 'msDS-UserPasswordExpiryTimeComputed', 'msDS-ResultantPSO', 'lockoutTime', 'sAMAccountName', 'displayName']
 		user_status = {'user_dn':'', 'user_id':'', 'user_displayname':'', 'acct_pwd_expiry_enabled':'', 'acct_pwd_expiry':'', 'acct_pwd_last_set':'', 'acct_pwd_expired':'', 'acct_pwd_policy':'', 'acct_disabled':'', 'acct_locked':'', 'acct_locked_expiry':'', 'acct_expired':'', 'acct_expiry':'',  'acct_can_change_pwd':'', 'acct_bad_states':[]}
@@ -162,7 +177,7 @@ class activedirectory:
 			results = self.conn.search_s(user_base, user_scope, user_filter, status_attribs)
 		except ldap.LDAPError, e:
 			raise self.ldap_error(e)
-		if len(results) != 1: # sAMAccountName must be unique
+		if results[0][0] is None: # sAMAccountName must be unique
 			raise self.user_not_found(user)
 		result = results[0]
 		user_dn = result[0]
@@ -201,6 +216,21 @@ class activedirectory:
 		# If there is something in s['acct_bad_states'] not in self.can_change_pwd_states, they can't change pwd.
 		s['acct_can_change_pwd'] = (0 if (len(set(s['acct_bad_states']) - set(self.can_change_pwd_states)) != 0) else 1)
 		return s
+	
+	def get_user_from_mobile(self, mobile):
+		user_base = '%s' % (self.base)
+		user_filter = '(mobile=%s)' % (mobile)
+		user_scope = ldap.SCOPE_SUBTREE
+		status_attribs = ['sAMAccountName', 'displayName','mobile']
+		try:
+			# search for user
+			results = self.conn.search_s(user_base, user_scope, user_filter, status_attribs)
+		except ldap.LDAPError, e:
+			raise self.ldap_error(e)
+		if results[0][0] is None: # sAMAccountName must be unique
+			raise self.user_not_found(user)
+		result = results[0]
+        	return result[1]['sAMAccountName'][0]
 
 	def get_pwd_policies(self):
 		default_policy_container = self.base
